@@ -7,6 +7,7 @@ import { z } from "zod";
 import { FETCH_FAILED, SCRAPE_FAILED } from "@/lib/errors.js";
 import { prisma } from "@stremio-addon/database";
 import { config, type Config } from "@stremio-addon/config";
+import { to } from "await-to-js";
 
 // gets cached in each user's database
 export const BasicMetadataSchema = z.object({
@@ -32,13 +33,16 @@ export type CatalogMetadata = z.infer<typeof CatalogMetadataSchema>;
 /** Using p-queue, caches Letterboxd relevant data. */
 export class LetterboxdCacher {
   listQueue: PQueue;
+  runningJobs = new Set<string>();
 
   constructor() {
     this.listQueue = new PQueue({ concurrency: serverEnv.QUEUE_CONCURRENCY });
   }
 
   addList(userConfig: Config) {
-    this.listQueue.add(() => this.scrapeList(userConfig));
+    if (!this.runningJobs.has(userConfig.url)) {
+      this.listQueue.add(() => this.scrapeList(userConfig));
+    }
   }
 
   /**
@@ -65,9 +69,22 @@ export class LetterboxdCacher {
       data-alt-poster="398196"
     />
     */
+
+    if (this.runningJobs.has(userConfig.url)) {
+      console.warn(
+        "Already running job for this URL, skipping:",
+        userConfig.url
+      );
+      return;
+    }
+
     try {
       const encodedConfig = await config.encode(userConfig);
-      const url = userConfig.url;
+      let url = userConfig.url;
+      // if it's a shuffle, just grab the films as usual. we will do our own shuffling later
+      if (url.includes("/by/shuffle/")) {
+        url = url.replace(/\/by\/shuffle\/.*$/, "/");
+      }
       const html = await fetchHtml(url);
       const $ = cheerio(html);
 
@@ -79,13 +96,9 @@ export class LetterboxdCacher {
 
       const foundPages = +$(".paginate-page").last().text();
       // TODO refactor this later
-      let pages = (() => {
-        if (foundPages > 10) return 10;
-        if (foundPages < 1) return 1;
-
-        return foundPages;
-      })();
-      if (new URL(url).pathname.includes("/films")) {
+      // min-max 1 to 10
+      let pages = Math.min(Math.max(1, foundPages), 10);
+      if (new URL(url).pathname.startsWith("/films")) {
         // 72 * 10 = 720
         pages = 10;
       }
@@ -93,7 +106,7 @@ export class LetterboxdCacher {
 
       for (let i = 1; i <= pages; i++) {
         const url = `${userConfig.url}${!userConfig.url.endsWith("/") ? "/" : ""}page/${i}/`;
-        logger.error(`Scraping page ${i} of ${pages} in ${url}`);
+        logger.info(`Scraping page ${i} of ${pages} in ${url}`);
         const html = await fetchHtml(url);
         const $ = cheerio(html);
 
@@ -133,9 +146,13 @@ export class LetterboxdCacher {
       }
 
       // scrape the IDs from the film pages and cache
-      scrapeIDsFromFilmPage(initialMeta).then(() => {
-        logger.info(`Successfully cached IDs for ${catalogName}`);
-      });
+      scrapeIDsFromFilmPage(initialMeta)
+        .then(() => {
+          logger.info(`Successfully cached IDs for ${catalogName}`);
+        })
+        .catch(logger.error);
+
+      this.runningJobs.delete(userConfig.url);
 
       return initialMeta;
     } catch (error) {
@@ -147,16 +164,25 @@ export class LetterboxdCacher {
 async function scrapeIDsFromFilmPage(initialMeta: BasicMetadata[]) {
   const idQueue = new PQueue({ concurrency: 3 });
 
-  const cachedIds = await prisma.film.findMany({
-    where: {
-      id: { in: initialMeta.map((meta) => meta.id) },
-      AND: {
-        updatedAt: {
-          gte: new Date(Date.now() - 1000 * 60 * 60 * 24 * 1),
+  const [cachedIdsErr, cachedIds] = await to(
+    prisma.film.findMany({
+      where: {
+        id: { in: initialMeta.map((meta) => meta.id) },
+        AND: {
+          updatedAt: {
+            gte: new Date(Date.now() - 1000 * 60 * 60 * 24 * 1),
+          },
         },
       },
-    },
-  });
+    })
+  );
+
+  if (cachedIdsErr || !cachedIds) {
+    logger.error("Failed to fetch cached IDs");
+    logger.error(cachedIdsErr);
+    return;
+  }
+
   const cachedIdsSet = new Set(cachedIds.map((meta) => meta.id));
   initialMeta = initialMeta.filter((meta) => !cachedIdsSet.has(meta.id));
   logger.info(`Found ${cachedIds.length} cached IDs`);
@@ -167,9 +193,17 @@ async function scrapeIDsFromFilmPage(initialMeta: BasicMetadata[]) {
   }
 
   for (const meta of initialMeta) {
+    if (!meta?.id) {
+      continue;
+    }
     idQueue.add(async () => {
       const url = `https://letterboxd.com/film/${meta.id}/`;
-      const html = await fetchHtml(url);
+      const [htmlErr, html] = await to(fetchHtml(url));
+      if (htmlErr || !html) {
+        logger.error(`Failed to fetch HTML for ${meta.id}`);
+        logger.error(htmlErr);
+        return;
+      }
       const $ = cheerio(html);
 
       //<a href="http://www.imdb.com/title/tt31806037/maindetails" class="micro-button track-event" data-track-action="IMDb" target="_blank">IMDb</a>`
@@ -215,7 +249,16 @@ async function scrapeIDsFromFilmPage(initialMeta: BasicMetadata[]) {
             tmdb,
             imdb,
           },
-          update: { imdb, tmdb },
+          update: {
+            title: meta.name,
+            director: JSON.stringify(directors),
+            cast: JSON.stringify(cast),
+            description: `${tagline.toUpperCase()} - ${description}`,
+            genres: JSON.stringify(genres),
+            year: releaseyear ? +releaseyear : undefined,
+            tmdb,
+            imdb,
+          },
         });
       } catch (error) {
         logger.error(`Couldn't update film ${meta.id} with IDs, ${error}`);
@@ -230,7 +273,7 @@ async function scrapeIDsFromFilmPage(initialMeta: BasicMetadata[]) {
  * Determine the catalog name from either a Cheerio instance or a URL
  */
 export async function determineCatalogName(opts: {
-  url?: string;
+  url: string;
   $?: ReturnType<typeof cheerio>;
 }): Promise<string> {
   try {
@@ -247,9 +290,26 @@ export async function determineCatalogName(opts: {
     }
 
     // <meta property="og:title" content="severance in some other forms" />
-    const catalogName = $("meta[property='og:title']").attr("content");
+    let catalogName = $("meta[property='og:title']").attr("content");
     if (!catalogName) {
-      throw new Error();
+      // predefined names for known URLs
+      const predefined = {
+        "/films/popular/": "Popular Films",
+        "/films/popular/this/week": "Popular Films This Week",
+        "/films/popular/this/month": "Popular Films This Month",
+        "/films/popular/this/year": "Popular Films This Year",
+      };
+
+      const urlPath = new URL(opts.url).pathname;
+      for (const [path, name] of Object.entries(predefined)) {
+        if (urlPath.startsWith(path)) {
+          catalogName = name;
+        }
+      }
+
+      if (!catalogName) {
+        throw new Error();
+      }
     }
 
     return catalogName;
@@ -261,9 +321,7 @@ export async function determineCatalogName(opts: {
   return "Catalog name not found";
 }
 
-async function resolveFinalUrl(
-  url: string
-): Promise<ReturnType<typeof wrappedFetch> | undefined> {
+async function resolveFinalUrl(url: string): Promise<string | undefined> {
   try {
     const res = await wrappedFetch(url, {
       redirect: "follow",
@@ -273,7 +331,7 @@ async function resolveFinalUrl(
       throw { ...FETCH_FAILED, status: res.status };
     }
 
-    return res;
+    return res.url;
   } catch (error) {
     logger.error(error);
   }
@@ -316,17 +374,19 @@ async function fetchHtml(
   headers?: Record<string, string>
 ): Promise<string> {
   logger.info(`Scraping HTML from ${url}`);
-  const res = await resolveFinalUrl(url);
-  if (!res) {
-    throw { ...SCRAPE_FAILED, message: "Failed to resolve final URL." };
-  }
-
-  const urlToScrape = await determineStrategy(res.url);
-
   try {
-    const res = await wrappedFetch(urlToScrape, { headers });
+    const [resFinalUrlErr, resFinalUrl] = await to(resolveFinalUrl(url));
+    if (resFinalUrlErr || !resFinalUrl) {
+      throw { ...SCRAPE_FAILED, message: "Failed to resolve final URL." };
+    }
 
-    if (!res.ok) {
+    const urlToScrape = await determineStrategy(resFinalUrl);
+
+    const [resErr, res] = await to(wrappedFetch(urlToScrape, { headers }));
+
+    if (resErr || !res.ok) {
+      if (resErr) logger.error(resErr);
+
       throw {
         ...FETCH_FAILED,
         message: `Couldn't scrape HTML: ${urlToScrape}`,
@@ -336,6 +396,7 @@ async function fetchHtml(
     logger.info("Successfully fetched HTML");
     return await res.text();
   } catch (error) {
+    logger.error(`Failed to fetch HTML from ${url}`);
     logger.error(error);
   }
 
@@ -349,11 +410,25 @@ async function scrapePostersForMetadata(
   $: ReturnType<typeof cheerio>
 ): Promise<BasicMetadata[]> {
   logger.info(`Scraping posters for metadata`);
-  let $posters = $(".film-poster");
-  logger.info(`Found ${$posters.length} posters`);
 
-  if ($posters.length === 0) {
-    $posters = $(".poster");
+  const posterSelectors = [".poster", ".film-poster"];
+
+  const $posters = (() => {
+    for (const selector of posterSelectors) {
+      const posters = $(selector);
+      if (posters.length > 0) {
+        console.info(
+          `Found posters with selector: ${selector}: ${posters.length}`
+        );
+        return posters;
+      }
+    }
+    return undefined;
+  })();
+
+  if (!$posters || $posters.length === 0) {
+    logger.warn("No posters found, returning empty metadata array");
+    return [];
   }
 
   const metadata: (BasicMetadata & { poster?: string })[] = [];
@@ -365,15 +440,15 @@ async function scrapePostersForMetadata(
   });
 
   $posters.each(function () {
-    const $el = $(this);
+    const $el = $(this).parent();
 
-    const filmSlug = $el.data("filmSlug");
+    const filmSlug = $el.data("itemSlug");
     const altPosterId = $el.data("altPoster");
-    const name = $el.find("img").first().prop("alt");
+    const name = $el.data("itemName");
 
     const parsedMetadata = InterimBasicMetadataSchema.parse({
       id: `${filmSlug}`,
-      name,
+      name: `${name}`,
       altPoster: altPosterId,
     });
 

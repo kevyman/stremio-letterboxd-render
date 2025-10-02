@@ -4,9 +4,10 @@ import {
   type AppBindingsWithConfig,
 } from "@/util/createHono.js";
 import { prisma } from "@stremio-addon/database";
-import { load as cheerio } from "cheerio";
+import { to } from "await-to-js";
 import type { Context } from "hono";
 import { INTERNAL_SERVER_ERROR, NOT_FOUND } from "stoker/http-status-codes";
+import { z } from "zod";
 
 const POSTER_TTL = 1000 * 60 * 60 * 24 * 7; // 1 week
 
@@ -24,20 +25,36 @@ async function fetchPoster(
   slug: string,
   altId?: string
 ): Promise<string | undefined> {
-  const POSTER_URL = `https://letterboxd.com/ajax/poster/film/${slug}/std/${altId ? `${altId}/` : ""}230x345/?k=${cacheBuster()}`;
-  const res = await fetch(POSTER_URL);
-  if (!res.ok) {
+  const POSTER_URL = `https://letterboxd.com/film/${slug}/poster/std${altId ? `/${altId}` : "/125"}/?k=${cacheBuster()}`;
+  logger.warn(`Fetching poster from ${POSTER_URL}`);
+
+  const shape = z.object({
+    url: z.string().url(),
+    url2x: z.string().url(),
+  });
+
+  const [resErr, res] = await to(fetch(POSTER_URL));
+  if (resErr || !res.ok) {
+    logger.error(
+      `Error fetching poster for ${slug}: ${res?.status} - ${res?.statusText}`
+    );
+    if (resErr) {
+      logger.error(resErr);
+    }
     return;
   }
 
-  const html = await res.text();
-  const $ = cheerio(html);
+  const json = await res.json();
 
-  const href = $("img").first().prop("srcset");
-
-  if (!href) {
+  const parsed = shape.safeParse(json);
+  if (!parsed.success) {
+    logger.error(`Error parsing poster JSON for ${slug}:`);
+    logger.error(parsed.error);
     return;
   }
+
+  // try to get the largest image possible
+  const href = parsed.data.url2x ?? parsed.data.url;
 
   return href;
 }
@@ -63,7 +80,6 @@ async function handleRoute(c: Context<AppBindingsWithConfig>) {
     }
 
     // cache in the background
-    c.var.logger.debug({ href, slug, altId });
     if (!cached) {
       prisma.poster
         .create({

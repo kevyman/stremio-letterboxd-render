@@ -10,33 +10,41 @@ export const configAPIRoute = createAPIRouter();
 
 configAPIRoute.get("/:encodedConfigOrId", async (c) => {
   const encodedConfigOrId = c.req.param("encodedConfigOrId");
-  const configRecord = await prisma.config.findFirst({
-    where: {
-      OR: [
-        {
-          id: encodedConfigOrId,
-        },
-        {
-          config: encodedConfigOrId,
-        },
-      ],
-    },
-  });
-  if (!configRecord) {
-    logger.error("Failed to fetch config", encodedConfigOrId);
-    return c.json({ success: false, message: "Config not found" }, NOT_FOUND);
-  }
+  try {
+    const configRecord = await prisma.config.findFirst({
+      where: {
+        OR: [
+          {
+            id: encodedConfigOrId,
+          },
+          {
+            config: encodedConfigOrId,
+          },
+        ],
+      },
+    });
+    if (!configRecord) {
+      logger.error("Failed to fetch config", encodedConfigOrId);
+      return c.json({ success: false, message: "Config not found" }, NOT_FOUND);
+    }
 
-  const parsedConfig = await config.decode(configRecord.config);
-  if (!parsedConfig) {
-    logger.error("Failed to decode config", configRecord.config);
+    const parsedConfig = await config.decode(configRecord.config);
+    if (!parsedConfig) {
+      logger.error("Failed to decode config", configRecord.config);
+      return c.json(
+        { success: false, message: "Failed to decode config" },
+        NOT_FOUND
+      );
+    }
+
+    return c.json({ success: true, config: parsedConfig });
+  } catch (error) {
+    logger.error("Failed to fetch config", error);
     return c.json(
-      { success: false, message: "Failed to decode config" },
+      { success: false, message: "Failed to fetch config" },
       NOT_FOUND
     );
   }
-
-  return c.json({ success: true, config: parsedConfig });
 });
 
 configAPIRoute.put("/:id", async (c) => {
@@ -46,17 +54,17 @@ configAPIRoute.put("/:id", async (c) => {
     logger.error("No config id provided");
     return c.json({ success: false });
   }
-  const body = await c.req.json();
-
-  // ensure config is legit
-  const parsed = ConfigSchema.safeParse(body);
-
-  if (!parsed.success) {
-    logger.error("Failed to parse config", parsed.error);
-    return c.json({ success: false, message: "Invalid config" }, NOT_FOUND);
-  }
-
   try {
+    const body = await c.req.json();
+
+    // ensure config is legit
+    const parsed = ConfigSchema.safeParse(body);
+
+    if (!parsed.success) {
+      logger.error("Failed to parse config", parsed.error);
+      return c.json({ success: false, message: "Invalid config" }, NOT_FOUND);
+    }
+
     const configRecord = await prisma.config.findFirst({
       where: {
         OR: [
@@ -102,47 +110,43 @@ configAPIRoute.post("/:encodedConfigOrId", async (c) => {
       return c.json({ success: false });
     }
 
-    const metadata = await letterboxdCacher.scrapeList(conf);
-
-    c.var.logger.info("Creating config", { encodedConfig, metadata });
-    let record;
+    c.var.logger.info("Creating config flow");
+    c.var.logger.info({
+      encodedConfig,
+      conf,
+    });
 
     try {
       // try to fetch the config, if it exists
-      record = await prisma.config.findFirst({
+      c.var.logger.info("Attempting to fetch config");
+      const record = await prisma.config.findFirst({
         where: {
           config: encodedConfig,
         },
       });
+      if (record) {
+        c.var.logger.info("Found existing config", { recordId: record.id });
+        return c.json({ success: true, id: record.id });
+      }
     } catch (error) {
       c.var.logger.warn("Failed to fetch config", error);
     }
 
-    if (!record) {
-      try {
-        // try to create the config
-        record = await prisma.config.create({
-          data: {
-            config: encodedConfig,
-            metadata: JSON.stringify(metadata),
-          },
-        });
-        c.var.logger.info("Create config", {
-          newRecordId: record.id,
-          encodedConfig,
-          metadata,
-        });
-      } catch (error) {
-        c.var.logger.error("Failed to create config", error);
-      }
-    }
+    // create an initial empty record to reserve the config
+    const newRecord = await prisma.config.create({
+      data: {
+        config: encodedConfig,
+        metadata: JSON.stringify([]),
+      },
+    });
 
-    // if it STILL doesn't exist, we've failed
-    if (!record) {
-      return c.json({ success: false });
-    }
+    // fetch metadata for the list and update in the background
+    letterboxdCacher.addList(conf);
 
-    const { id } = record;
+    // should never change, set to immutable
+    c.header("Cache-Control", "max-age=31536000, immutable, public");
+
+    const { id } = newRecord;
 
     return c.json({ success: true, id });
   } catch (error) {

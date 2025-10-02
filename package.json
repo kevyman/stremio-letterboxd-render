@@ -9,16 +9,17 @@
     "lint": "eslint .",
     "format": "prettier ./packages --write .",
     "build": "pnpm -r build",
-    "start": "pnpm -r start",
+    "start": "pnpm --filter @stremio-addon/server start",
     "prepare": "pnpm format && husky",
     "db:seed": "pnpm --filter @stremio-addon/server db:seed",
     "db:push": "pnpm --filter @stremio-addon/database db:push",
+    "db:deploy": "pnpm --filter @stremio-addon/database db:deploy",
     "prisma:generate": "pnpm --filter @stremio-addon/database prisma generate"
   },
   "keywords": [],
   "author": "",
   "license": "MIT",
-  "packageManager": "pnpm@10.5.0+sha512.11106a5916c7406fe4b8cb8e3067974b8728f47308a4f5ac5e850304afa6f57e2847d7950dfe78877d8d36bfb401d381c4215db3a4c3547ffa63c14333a6fa51",
+  "packageManager": "pnpm@10.17.1+sha512.17c560fca4867ae9473a3899ad84a88334914f379be46d455cbf92e5cf4b39d34985d452d2583baf19967fa76cb5c17bc9e245529d0b98745721aa7200ecaf7a",
   "type": "module",
   "engines": {
     "node": ">=22.11.0"
@@ -34,7 +35,7 @@
     "husky": "^9.1.7",
     "prettier": "^3.5.2",
     "syncpack": "^13.0.2",
-    "tsx": "^4.19.3",
+    "tsx": "^4.20.3",
     "typescript-eslint": "^8.24.1"
   }
 }

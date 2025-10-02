@@ -1,10 +1,8 @@
 import { createRouter } from "@/util/createHono.js";
 import { addonManifest, createManifest } from "@/util/manifest.js";
-import {
-  determineCatalogName,
-  letterboxdCacher,
-} from "@/workers/letterboxdCacher.js";
+import { determineCatalogName } from "@/workers/letterboxdCacher.js";
 import { INTERNAL_SERVER_ERROR } from "stoker/http-status-codes";
+import { to } from "await-to-js";
 
 export const manifestRouter = createRouter();
 
@@ -21,16 +19,25 @@ manifestRouter.get("/", async (c) => {
   const conf = c.var.config;
 
   let catalogName = conf.catalogName;
-  try {
-    if (!catalogName) {
-      // if the catalog name is not provided, determine it from the letterboxd page
-      catalogName = await determineCatalogName({
+  if (!catalogName) {
+    // if the catalog name is not provided, determine it from the letterboxd page
+    const [nameErr, name] = await to(
+      determineCatalogName({
         url: conf.url,
-      });
+      })
+    );
+
+    if (nameErr) {
+      c.var.logger.error("Failed to determine catalog name.");
+      return c.text(nameErr.message, INTERNAL_SERVER_ERROR);
     }
-  } catch {
-    c.var.logger.error("Failed to determine catalog name.");
-    return c.text("", INTERNAL_SERVER_ERROR);
+
+    if (!name) {
+      c.var.logger.error("Failed to determine catalog name.");
+      return c.text("Failed to determine catalog name.", INTERNAL_SERVER_ERROR);
+    }
+
+    catalogName = name;
   }
 
   let posterChoice = "";
@@ -52,6 +59,21 @@ manifestRouter.get("/", async (c) => {
       break;
   }
 
+  // figure out the sort
+  let sort = "Default";
+  console.info("Config URL:", conf.url);
+  const splitUrl = conf.url.split("/").filter((part) => part.length > 0);
+  const byIndex = splitUrl.indexOf("by");
+  if (byIndex !== -1 && byIndex < splitUrl.length - 1) {
+    sort = splitUrl[byIndex + 1];
+    // convert hyphens to spaces and capitalize each word
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    sort = sort
+      .split("-")
+      .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+      .join(" ");
+  }
+
   const manifest = createManifest({
     ...addonManifest,
     behaviorHints: {
@@ -59,7 +81,7 @@ manifestRouter.get("/", async (c) => {
       configurable: true,
       configurationRequired: false,
     },
-    id: `${addonManifest.id}:${c.var.configString}`,
+    id: `${addonManifest.id}:${c.var.configId ?? c.var.configString}`,
     name: `Letterboxd - ${catalogName}`,
     description: `Adds ${catalogName} as a catalog. Using ${posterChoice} posters.`,
     resources: [
@@ -80,13 +102,16 @@ manifestRouter.get("/", async (c) => {
             name: "skip",
             isRequired: false,
           },
+          // NOTE: adding this back in causes it to not show up on the main page
+          // {
+          //   name: "genre",
+          //   isRequired: true,
+          //   options: [sort],
+          // },
         ],
       },
     ],
   });
-
-  // once the manifest is created, begin caching films
-  letterboxdCacher.addList(conf);
 
   return c.json(manifest);
 });

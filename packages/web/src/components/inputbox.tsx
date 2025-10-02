@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Toaster, toast } from "react-hot-toast";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -17,6 +17,29 @@ function SortOption(props: { name: string; url: string }) {
     </option>
   );
 }
+
+const NamePlaceholders = [
+  "Movies I Pretend to Have Seen",
+  "Films That Made Me Ugly Cry",
+  "My Netflix Queue of Eternal Shame",
+  "Movies I Started but Never Finished",
+  "Films I Love but Can't Admit Publicly",
+  "Movies That Are Definitely Not Rom-Coms",
+  "Films I Watch When I Need to Feel Smart",
+  "My 'It's So Bad It's Good' Collection",
+  "Movies I Quote Way Too Often",
+  "Films That Ruined My Sleep Schedule",
+  "Movies I Watch to Procrastinate Adulting",
+  "Films That Made Me Question Reality",
+  "My 'Watch This When Sick' Collection",
+  "Movies I Judge People For Not Liking",
+  "Films I'll Never Admit Scared Me",
+  "My Comfort Food Cinema Selection",
+  "Movies That Broke My Heart (And I Liked It)",
+  "Films I Use to Test New Speakers",
+  "My 'Background Noise While Cleaning' List",
+  "Movies That Made Me Google the Ending",
+];
 
 /**
  * Resolves a Boxt.it URL to the final destination.
@@ -37,6 +60,50 @@ async function resolveUrl(url: string) {
   }
 }
 
+async function getConfigFromId(id: string): ReturnType<typeof config.decode> {
+  try {
+    const res = await fetch(`/api/config/${id}`, {
+      headers: { "cache-control": "max-age: 600" },
+    });
+    if (res.ok) {
+      const json = await res.json();
+
+      const parsed = z
+        .object({
+          success: z.boolean(),
+          config: z.object({
+            url: z.string().url(),
+            catalogName: z.string(),
+            posterChoice: z.enum([
+              "letterboxd",
+              "cinemeta",
+              "letterboxd-ratings",
+              "letterboxd-custom-from-list",
+              "rpdb",
+            ]),
+            rpdbApiKey: z.string(),
+            origin: z.string().url(),
+          }),
+        })
+        .parse(json);
+
+      if (parsed.success && parsed.config) {
+        return parsed.config;
+      } else {
+        console.warn("Failed to fetch config from ID", parsed);
+      }
+    } else {
+      console.warn("Failed to fetch config from ID", res.statusText);
+
+      window.location.href = "/configure";
+    }
+  } catch (error) {
+    console.warn("Failed to fetch config from ID", error);
+  }
+
+  return undefined;
+}
+
 export default function Inputbox() {
   const [formDisabled, setFormDisabled] = useState(false);
   const [manifestUrl, setManifestUrl] = useState("");
@@ -47,6 +114,24 @@ export default function Inputbox() {
     });
   const watchedPosterChoice = watch("posterChoice");
   const watchedUrl = watch("url");
+  const [configId, setConfigId] = useState<string>();
+
+  // initial load if the URL has an ID in it, load that config
+  useEffect(() => {
+    const configId = new URLSearchParams(window.location.search).get("id");
+    if (configId) {
+      getConfigFromId(configId).then((conf) => {
+        if (conf) {
+          setConfigId(configId);
+          // set the form values
+          setValue("url", conf.url);
+          setValue("catalogName", conf.catalogName ?? "");
+          setValue("posterChoice", conf.posterChoice ?? "letterboxd");
+          setValue("rpdbApiKey", conf.rpdbApiKey ?? "");
+        }
+      });
+    }
+  }, []);
 
   /**
    * Fetches a recommendation from the server and sets the URL field.
@@ -64,7 +149,8 @@ export default function Inputbox() {
         .object({ recommendation: z.string() })
         .parse(json);
       const recommendedUrl = `https://letterboxd.com${recommendation}`;
-      setValue("url", recommendedUrl);
+      const resolvedUrl = await resolveUrl(recommendedUrl);
+      setValue("url", resolvedUrl);
       setManifestUrl("");
     } catch (error) {
       console.warn(error);
@@ -196,6 +282,17 @@ export default function Inputbox() {
   return (
     <div>
       <Toaster />
+      {configId && (
+        <div className="text-center">
+          Your Config ID:{" "}
+          <code
+            className="p-1 border border-white hover:cursor-pointer"
+            onClick={() => navigator.clipboard.writeText(configId)}
+          >
+            {configId}
+          </code>
+        </div>
+      )}
       <form onSubmit={handleSubmit(onSubmit)}>
         <div className="grid grid-cols-1 gap-2">
           <div className="text-base">
@@ -205,7 +302,7 @@ export default function Inputbox() {
           <div className="flex flex-col gap-1 sm:flex-row">
             <input
               type="text"
-              placeholder="https://letterboxd.com/almosteffective/watchlist"
+              placeholder="https://letterboxd.com/almosteffective/watchlist/"
               {...register("url")}
               disabled={formDisabled}
               onBlur={() => {
@@ -260,12 +357,16 @@ export default function Inputbox() {
             </button>
           </div>
           <div className="text-base">
-            Set a custom list if you'd like (leave empty to auto-generate):
+            Set a custom name if you'd like (leave empty to auto-generate):
           </div>
           <div>
             <input
               type="text"
-              placeholder="Probably Hugh Jackman's Watchlist"
+              placeholder={
+                NamePlaceholders[
+                  Math.floor(Math.random() * NamePlaceholders.length)
+                ]
+              }
               {...register("catalogName")}
               className="w-full border border-black bg-white text-[#202830] rounded text-xl px-2 py-1"
             />
@@ -338,7 +439,7 @@ export default function Inputbox() {
 
           <div className="flex gap-1 justify-around">
             <div
-              className={`${!formState.isDirty ? "hidden" : ""} flex gap-1 justify-around grow`}
+              className={`${!manifestUrl?.length ? "hidden" : ""} flex gap-1 justify-around grow`}
             >
               <button
                 className="grow border border-white bg-white uppercase text-[#202830] text-lg p-2 rounded font-bold hover:bg-[#202830] hover:text-white hover:underline"

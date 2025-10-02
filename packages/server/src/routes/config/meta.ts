@@ -1,12 +1,19 @@
-import { tmdb } from "@/lib/tmdb.js";
 import { createRouter } from "@/util/createHono.js";
 import { getError } from "@/util/errors.js";
-import { prisma } from "@stremio-addon/database";
-import type { MetaDetail } from "stremio-addon-sdk";
+import { LetterboxdSource } from "@/sources/Letterboxd.js";
+import { createCache } from "@/lib/sqliteCache.js";
+
+const letterboxdSource = new LetterboxdSource();
+const cache = createCache<{
+  lid: string;
+  imdb?: string;
+  tmdb?: string;
+}>("lbxd-id", 1000 * 60 * 60 * 24 * 30); // 30 days
 
 // should match: /:config/meta/:type/:id/:extras?.json
 // ex: /configexample/meta/movie/123456.json
 export const metaRouter = createRouter();
+const tmdbInstanceUrl = `https://94c8cb9f702d-tmdb-addon.baby-beamup.club`;
 
 metaRouter.get("/:type/:id.json", async (c) => {
   // redirect to tmdb-addon endpoint
@@ -20,49 +27,74 @@ metaRouter.get("/:type/:id.json", async (c) => {
 
   id = id.replace(/\.json$/, "");
 
-  const [, idWithoutPrefix, errorCode] = id.split(":");
+  /*
+  - letterboxd:slug
+  - letterboxd:id-lid
+  */
+  const [, slugOrLid, errorCode] = id.split(":");
 
-  c.var.logger.debug(`meta ${type} ${idWithoutPrefix}`);
+  c.var.logger.debug(`meta ${type} ${slugOrLid}`);
 
   // handle error metas
-  if (idWithoutPrefix === "error") {
+  if (slugOrLid === "error") {
     return c.json({ meta: getError(errorCode, c.var.config) });
   }
 
-  try {
-    const cached = await prisma.film.findFirst({
-      where: {
-        id: idWithoutPrefix,
-      },
-    });
+  const cacheKey = slugOrLid;
+  const cached = await cache.get(cacheKey);
+  if (cached) {
+    c.var.logger.info("Found cached Letterboxd ID", cached);
 
-    if (!cached) {
-      return c.json({ meta: {} }, 404);
+    if (cached.imdb) {
+      return c.redirect(
+        `https://v3-cinemeta.strem.io/meta/${type}/${cached.imdb}.json`
+      );
     }
 
-    // check if it's available
-    const tmdbUrl = `https://94c8cb9f702d-tmdb-addon.baby-beamup.club/meta/${type}/tmdb:${cached.tmdb}.json`;
-    const available = await fetch(tmdbUrl);
-    if (!available.ok) {
-      c.var.logger.info("Not available on TMDB", available.status);
+    if (cached.tmdb) {
+      return c.redirect(
+        `${tmdbInstanceUrl}/meta/${type}/tmdb:${cached.tmdb}.json`
+      );
+    }
+  }
 
-      try {
-        const tmdbMeta = await tmdb().getMovieDetails(+cached.tmdb);
+  try {
+    const split = slugOrLid.split("-");
+    let lid: string | null = split[0] === "id" ? split[1] : null;
+    console.info({ lid, slugOrLid, split: slugOrLid.split("-") });
+    if (!lid) {
+      lid = await letterboxdSource.getLetterboxdID(`/film/${slugOrLid}`);
+    }
 
-        const meta: MetaDetail = {
-          id: `tmdb:${tmdbMeta.id}`,
-          type: "movie",
-          name: tmdbMeta.title,
-        };
+    if (!lid) {
+      c.var.logger.error(`Failed to find Letterboxd ID for ${slugOrLid}`);
+      return c.text("Error fetching meta data", 500);
+    }
 
-        return c.json({ meta });
-      } catch (error) {
-        c.var.logger.error("Error fetching meta data", error);
-        return c.json({ meta: {} }, 500);
+    const lbxdMeta = await letterboxdSource.getFilm(lid);
+    if (lbxdMeta) {
+      c.var.logger.info("Found Letterboxd meta", lbxdMeta);
+
+      const ids = {
+        tmdb: lbxdMeta.links?.find((link) => link.type === "tmdb")?.id,
+        imdb: lbxdMeta.links?.find((link) => link.type === "imdb")?.id,
+      };
+
+      console.info("Storing Letterboxd ID mapping in cache", { lid, ...ids });
+      await cache.set(cacheKey, { lid, ...ids });
+
+      if (ids.imdb) {
+        return c.redirect(
+          `https://v3-cinemeta.strem.io/meta/${type}/${ids.imdb}.json`
+        );
+      }
+
+      if (ids.tmdb) {
+        return c.redirect(
+          `${tmdbInstanceUrl}/meta/${type}/tmdb:${ids.tmdb}.json`
+        );
       }
     }
-
-    return c.redirect(tmdbUrl);
   } catch (error) {
     c.var.logger.error("Error fetching meta data", error);
   }
